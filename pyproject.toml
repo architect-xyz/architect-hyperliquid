@@ -1,0 +1,22 @@
+[project]
+name = "architect-hyperliquid"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "architect-py",
+    "grpcio>=1.71.0",
+    "hyperliquid-python-sdk>=0.10.1",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11.2",
+]
+
+[tool.uv.sources]
+architect-py = { git = "https://github.com/architect-xyz/architect-py.git", rev = "f06ddbfe1273701b6bb4022916ba312c80d09aca" }
+
+[tool.ruff.lint]
+extend-select = ["B", "I"]
