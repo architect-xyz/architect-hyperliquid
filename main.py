@@ -1,48 +1,170 @@
 import time
+import asyncio
+import uuid
+from datetime import datetime
+from eth_typing import ChecksumAddress
 import grpc
+import logging
+import argparse
+import json
+from pprint import pprint
+from decimal import Decimal
 from concurrent import futures
 from architect_py.grpc_client.Cpty.CptyRequest import CancelOrder, PlaceOrder
-from architect_py.grpc_client.Cpty.CptyResponse import Symbology
-from architect_py.grpc_client.definitions import CptyLoginRequest, CptyLogoutRequest
+from architect_py.grpc_client.Cpty.CptyResponse import Symbology, UpdateAccountSummary
+from architect_py.grpc_client.definitions import (
+    CptyLoginRequest,
+    CptyLogoutRequest,
+    ExecutionInfo,
+    AccountStatistics,
+    AccountPosition,
+)
 from architect_py.grpc_client.grpc_server import (
     add_CptyServicer_to_server,
     CptyServicer,
     add_OrderflowServicer_to_server,
     OrderflowServicer,
 )
+import eth_account
+import hyperliquid
+import hyperliquid.info
+from eth_account.signers.local import LocalAccount
+from hyperliquid.exchange import Exchange
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s")
+logger.setLevel(logging.DEBUG)
 
 
 class MockCptyServicer(CptyServicer, OrderflowServicer):
-    def Cpty(self, request_iterator, context):
-        context.set_code(grpc.StatusCode.OK)
-        context.send_initial_metadata({})
-        # send symbology
-        yield Symbology(
-            execution_info={
-                "FOO Crypto/USD": {
-                    "MOCK": {
-                        "execution_venue": "MOCK",
-                        "exchange_symbol": None,
-                        "tick_size": {"simple": "0.01"},
-                        "step_size": "0.1",
-                        "min_order_quantity": "0",
-                        "min_order_quantity_unit": {"unit": "base"},
-                        "is_delisted": False,
-                        "initial_margin": None,
-                        "maintenance_margin": None,
-                    }
+    hyperliquid_account_address: ChecksumAddress
+    hyperliquid_info: hyperliquid.info.Info
+
+    architect_account_id: uuid.UUID
+    architect_symbology: Symbology
+    architect_symbols: dict[str, str]  # map of hyperliquid symbol => architect symbol
+
+    next_connection_id: int
+    broadcast_queues: dict[int, asyncio.Queue]
+    orderflow_queues: dict[int, asyncio.Queue]
+
+    def __init__(
+        self, *, base_url: str, account_address: ChecksumAddress, account_id: uuid.UUID
+    ):
+        self.hyperliquid_account_address = account_address
+        self.hyperliquid_info = hyperliquid.info.Info(base_url)
+
+        # load hyperliquid markets and convert to Architect symbology
+        self.architect_symbols = {}
+        execution_info: dict[str, dict[str, ExecutionInfo]] = {}
+        meta = self.hyperliquid_info.meta()
+        for perp_market in meta["universe"]:
+            tradable_product = (
+                f"{perp_market['name']}-USDC Hyperliquid Perpetual/USDC Crypto"
+            )
+            self.architect_symbols[perp_market["name"]] = tradable_product
+            step_size = Decimal(10) ** (-perp_market["szDecimals"])
+            MAX_DECIMALS = 6
+            tick_size = Decimal(10) ** (-(MAX_DECIMALS - perp_market["szDecimals"]))
+            execution_info[tradable_product] = {
+                "HYPERLIQUID": {
+                    "execution_venue": "HYPERLIQUID",
+                    "exchange_symbol": perp_market["name"],
+                    "tick_size": {"simple": tick_size},
+                    "step_size": step_size,
+                    "min_order_quantity": "0",
+                    "min_order_quantity_unit": {"unit": "base"},
+                    "is_delisted": False,
+                    "initial_margin": None,
+                    "maintenance_margin": None,
                 }
             }
-        )
-        for req in request_iterator:
-            if isinstance(req, CptyLoginRequest):
-                print("login message received", req)
-            elif isinstance(req, CptyLogoutRequest):
-                print("logout message received", req)
-            elif isinstance(req, PlaceOrder):
-                print("place_order message received", req)
-            elif isinstance(req, CancelOrder):
-                print("cancel_order message received", req)
+
+        self.architect_account_id = account_id
+        self.architect_symbology = Symbology(execution_info=execution_info)
+        self.next_connection_id = 1
+        self.broadcast_queues = {}
+        self.orderflow_queues = {}
+
+    async def periodically_snapshot_accounts(self):
+        while True:
+            user_state = self.hyperliquid_info.user_state(
+                address=self.hyperliquid_account_address
+            )
+            logger.debug("user_state: %s", json.dumps(user_state))
+            dt = datetime.fromtimestamp(user_state["time"] / 1000.0)
+            balances = {
+                "USDC Crypto": Decimal(user_state["marginSummary"]["totalRawUsd"])
+            }
+            positions = {}
+            for ap in user_state["assetPositions"]:
+                p = ap["position"]
+                symbol = self.architect_symbols[p["coin"]]
+                if p["liquidationPx"] is not None:
+                    liquidation_price = Decimal(p["liquidationPx"])
+                else:
+                    liquidation_price = None
+                positions[symbol] = AccountPosition(
+                    quantity=Decimal(p["szi"]),
+                    cost_basis=Decimal(p["entryPx"])
+                    * Decimal(p["szi"]),  # CR alee: might have to multiply by qty
+                    liquidation_price=liquidation_price,
+                )
+            account_summary = UpdateAccountSummary(
+                account=self.architect_account_id,
+                is_snapshot=True,
+                timestamp=int(dt.timestamp()),
+                timestamp_ns=int((dt.timestamp() % 1) * 1_000_000_000),
+                balances=balances,
+                positions=positions,
+                statistics=AccountStatistics(
+                    equity=Decimal(user_state["marginSummary"]["accountValue"]),
+                    position_margin=Decimal(
+                        user_state["marginSummary"]["totalMarginUsed"]
+                    ),
+                ),
+            )
+            logger.debug("account_summary: %s", account_summary)
+            for queue in self.broadcast_queues.values():
+                queue.put_nowait(account_summary)
+            await asyncio.sleep(3)
+
+    async def Cpty(self, request_iterator, context):
+        try:
+            context.set_code(grpc.StatusCode.OK)
+            context.send_initial_metadata({})
+            # send Architect symbology
+            yield self.architect_symbology
+            # register this RPC handler for broadcast events
+            connection_id = self.next_connection_id
+            self.next_connection_id += 1
+            queue = asyncio.Queue()
+            self.broadcast_queues[connection_id] = queue
+            # start a task to handle cpty requests
+            cpty_task = asyncio.create_task(
+                self.serve_cpty_requests(
+                    connection_id, queue, request_iterator, context
+                )
+            )
+            async for cpty_response in queue:
+                yield cpty_response
+            # serve CptyRequests
+        finally:
+            del self.broadcast_queues[connection_id]
+
+    async def serve_cpty_requests(
+        self, connection_id: int, queue: asyncio.Queue, request_iterator, context
+    ):
+        async for req in request_iterator:
+            logger.debug("(connection_id=%d) received: %s", connection_id, req)
+            # if isinstance(req, CptyLoginRequest):
+            #     print("login message received", req)
+            # elif isinstance(req, CptyLogoutRequest):
+            #     print("logout message received", req)
+            # elif isinstance(req, PlaceOrder):
+            #     print("place_order message received", req)
+            # elif isinstance(req, CancelOrder):
+            #     print("cancel_order message received", req)
 
     def SubscribeOrderflow(self, request, context):
         context.set_code(grpc.StatusCode.OK)
@@ -50,17 +172,53 @@ class MockCptyServicer(CptyServicer, OrderflowServicer):
         time.sleep(100)
 
 
-def main():
-    thread_pool = futures.ThreadPoolExecutor(max_workers=10)
-    server = grpc.server(thread_pool)
-    servicer = MockCptyServicer()
+async def main():
+    parser = argparse.ArgumentParser(prog="architect-hyperliquid")
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--log-level", type=str, default="DEBUG")
+    args = parser.parse_args()
+
+    logger.setLevel(args.log_level)
+    logger.info("loading config from %s...", args.config)
+    with open(args.config, "r") as f:
+        config = json.load(f)
+    logger.info("config loaded")
+
+    if "base_url" in config:
+        base_url = config["base_url"]
+    else:
+        base_url = "https://api.hyperliquid.xyz"
+    logger.info("using base url: %s", base_url)
+
+    account: LocalAccount = eth_account.Account.from_key(config["secret_key"])
+    address = config["account_address"]
+    if address == "":
+        address = account.address
+    logger.info("running with account address: %s", address)
+    if address != account.address:
+        logger.info("running with agent address: %s", account.address)
+
+    servicer = MockCptyServicer(
+        base_url=base_url,
+        account_address=address,
+        account_id=uuid.UUID(config["account_id"]),
+    )
+    server = grpc.aio.server()
     add_CptyServicer_to_server(servicer, server)
     add_OrderflowServicer_to_server(servicer, server)
-    server.add_insecure_port("[::]:50051")
-    server.start()
-    print("server started on port 50051")
-    server.wait_for_termination()
+    listen_addr = "[::]:50051"
+    server.add_insecure_port(listen_addr)
+    logger.info("starting server on %s...", listen_addr)
+    await server.start()
+    logger.info("server started")
+    server_task = asyncio.create_task(server.wait_for_termination(), name="server")
+    snapshot_task = asyncio.create_task(
+        servicer.periodically_snapshot_accounts(), name="snapshot"
+    )
+    await asyncio.wait(
+        [server_task, snapshot_task], return_when=asyncio.FIRST_COMPLETED
+    )
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
