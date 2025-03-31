@@ -139,6 +139,8 @@ class MockCptyServicer(CptyServicer, OrderflowServicer):
             return None
         if hl_order["cloid"] is not None:
             cloid_parts = hl_order["cloid"].split(":")
+        else:
+            cloid_parts = None
         if len(cloid_parts) == 2:
             seqid = cloid_parts[0]
             seqno = int(cloid_parts[1])
