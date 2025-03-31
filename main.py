@@ -1,47 +1,43 @@
-import time
+import argparse
 import asyncio
+import json
+import logging
+import time
 import uuid
 from datetime import datetime
-from eth_typing import ChecksumAddress
-import grpc
-import logging
-import argparse
-import json
-from pprint import pprint
 from decimal import Decimal
-from concurrent import futures
-from architect_py.scalars import OrderDir
+
+import eth_account
+import grpc
+import hyperliquid
+import hyperliquid.exchange
+import hyperliquid.info
 from architect_py.grpc_client.Cpty.CptyRequest import CancelOrder, PlaceOrder
 from architect_py.grpc_client.Cpty.CptyResponse import (
+    ReconcileOpenOrder,
     Symbology,
     UpdateAccountSummary,
-    ReconcileOpenOrder,
 )
-from architect_py.grpc_client.Oms.Order import Order, OrderType
 from architect_py.grpc_client.definitions import (
-    CptyLoginRequest,
-    CptyLogoutRequest,
-    ExecutionInfo,
-    AccountStatistics,
     AccountPosition,
+    AccountStatistics,
+    ExecutionInfo,
     OrderId,
-    OrderStatus,
     OrderSource,
-    TimeInForce,
+    OrderStatus,
     TimeInForceEnum,
 )
 from architect_py.grpc_client.grpc_server import (
-    add_CptyServicer_to_server,
     CptyServicer,
-    add_OrderflowServicer_to_server,
     OrderflowServicer,
+    add_CptyServicer_to_server,
+    add_OrderflowServicer_to_server,
 )
-import eth_account
-import hyperliquid
-import hyperliquid.info
-import hyperliquid.exchange
-from hyperliquid.utils.types import Cloid
+from architect_py.grpc_client.Oms.Order import Order, OrderType
+from architect_py.scalars import OrderDir
 from eth_account.signers.local import LocalAccount
+from eth_typing import ChecksumAddress
+from hyperliquid.utils.types import Cloid
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s")
