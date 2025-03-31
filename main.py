@@ -141,7 +141,7 @@ class MockCptyServicer(CptyServicer, OrderflowServicer):
             cloid_parts = hl_order["cloid"].split(":")
         else:
             cloid_parts = None
-        if len(cloid_parts) == 2:
+        if cloid_parts is not None and len(cloid_parts) == 2:
             seqid = cloid_parts[0]
             seqno = int(cloid_parts[1])
             order_id = OrderId(seqid=seqid, seqno=seqno)
@@ -156,7 +156,7 @@ class MockCptyServicer(CptyServicer, OrderflowServicer):
         return Order.new(
             account=str(self.architect_account_id),
             dir=dir,
-            id=order_id,
+            id=f"{order_id.seqid}:{order_id.seqno}",
             status=OrderStatus.Open,
             quantity=orig_sz,
             symbol=symbol,
@@ -191,12 +191,12 @@ class MockCptyServicer(CptyServicer, OrderflowServicer):
                     liquidation_price = Decimal(p["liquidationPx"])
                 else:
                     liquidation_price = None
-                positions[symbol] = AccountPosition(
+                positions[symbol] = [AccountPosition(
                     quantity=Decimal(p["szi"]),
                     cost_basis=Decimal(p["entryPx"])
                     * Decimal(p["szi"]),  # CR alee: might have to multiply by qty
                     liquidation_price=liquidation_price,
-                )
+                )]
             account_summary = UpdateAccountSummary(
                 account=str(self.architect_account_id),
                 is_snapshot=True,
@@ -233,7 +233,7 @@ class MockCptyServicer(CptyServicer, OrderflowServicer):
         self.next_connection_id += 1
         try:
             context.set_code(grpc.StatusCode.OK)
-            context.send_initial_metadata({})
+            await context.send_initial_metadata({})
             # send Architect symbology
             yield self.architect_symbology
             # send open orders snapshot
@@ -275,10 +275,10 @@ class MockCptyServicer(CptyServicer, OrderflowServicer):
             elif isinstance(req, CancelOrder):
                 pass
 
-    def SubscribeOrderflow(self, request, context):
+    async def SubscribeOrderflow(self, request, context):
         context.set_code(grpc.StatusCode.OK)
-        context.send_initial_metadata({})
-        time.sleep(100)
+        await context.send_initial_metadata({})
+        await asyncio.sleep(1000)
 
 
 async def main():
